@@ -74,29 +74,25 @@ uint32_t lastTouchMs = 0;
 // Fires MID-DRAG, not on release, so navigation feels immediate.
 #define SWIPE_THRESHOLD 26
 
-// ---- network scheduler
-uint32_t lastNet = 0, lastQuoteRot = 0, lastMsg = 0;
+// ---- quote rotation (offline pack, cheap — stays on the UI task)
+uint32_t lastQuoteRot = 0;
 int quoteIdx = 0;
 
-// ---- live message feed
-String messageUrl;            // provisioned from NVS at boot (secret token inside)
-#define MSG_POLL_MS (30UL * 1000UL)   // check for a new message every 30s
-
-// ---- Wi-Fi creds held for reconnect attempts (loaded once from NVS)
+// ---- config loaded once in setup(), then read-only (safe to share)
+String messageUrl;            // provisioned from NVS (secret token inside)
 String wifiSsid, wifiPass;
-bool   wifiWasUp = false;
-uint32_t lastWifiTry = 0;
+#define MSG_POLL_MS   (30UL * 1000UL)   // check for a new message every 30s
 #define WIFI_RETRY_MS (20UL * 1000UL)
 
-void pollMessage() {
-  if (messageUrl.length() == 0) return;
-  char buf[160];
-  if (fetchMessage(messageUrl, buf, sizeof(buf))) {
-    if (face.setMessage(buf)) {          // true only when the text changed
-      Serial.printf("[message] NEW: \"%s\"\n", buf);   // notify (serial + on-screen)
-    }
-  }
-}
+// ---- Networking runs on its OWN FreeRTOS task (netTask), so a slow/blocking
+// HTTPS fetch or Wi-Fi handshake never freezes the display or touch. The task
+// fetches into `netShared` under a mutex; the UI task drains it each frame and
+// applies the results to `face` (keeping all face mutation on the UI thread).
+SemaphoreHandle_t netMx = nullptr;
+struct {
+  char     msg[160];  bool msgReady = false;
+  MoonData moon;      GhData gh;     bool dataReady = false;
+} netShared;
 
 // ---- battery
 int readBatteryPct() {
@@ -106,23 +102,64 @@ int readBatteryPct() {
   return constrain(pct, 0, 100);
 }
 
-void refreshNetworkData() {
-  if (!netUp()) return;
-  // Weather page removed 2026-07-23 — no longer fetched.
-  MoonData m = computeMoon(time(nullptr)); face.setMoon(m);
-  GhData g = fetchGitHub();        face.setGitHub(g);
-  char q[160]; fetchQuote(q, sizeof(q), quoteIdx); face.setQuote(q);
+// Publish a fetched message into the shared buffer for the UI to pick up.
+static void publishMessage(const char* m) {
+  xSemaphoreTake(netMx, portMAX_DELAY);
+  strlcpy(netShared.msg, m, sizeof(netShared.msg));
+  netShared.msgReady = true;
+  xSemaphoreGive(netMx);
+}
+static void publishData(const MoonData& m, const GhData& g) {
+  xSemaphoreTake(netMx, portMAX_DELAY);
+  netShared.moon = m; netShared.gh = g; netShared.dataReady = true;
+  xSemaphoreGive(netMx);
 }
 
-// Runs once each time a Wi-Fi link is established — at boot or on a later
-// reconnect. Idempotent, so calling it again on every reconnect is fine.
-void onWifiConnected() {
-  wifiWasUp = true;
-  Serial.print("WiFi up: http://"); Serial.println(WiFi.localIP());
-  otaBegin("deskbuddy");            // LAN OTA: browser + Arduino IDE network port
-  delay(200);
-  refreshNetworkData();  lastNet = millis();
-  pollMessage();         lastMsg = millis();
+// The ENTIRE networking lifecycle lives here, off the UI thread: initial
+// connect, reconnect on the marginal AP, LAN-OTA servicing, and the periodic
+// message + GitHub fetches. Blocking calls here only stall THIS task; the UI
+// keeps rendering at full rate because FreeRTOS runs it while this task waits
+// on the socket.
+void netTask(void*) {
+  bool     wasUp    = false;
+  uint32_t lastTry  = 0, lastMsgF = 0, lastDataF = 0;
+
+  netBegin(wifiSsid, wifiPass);          // blocking connect — UI unaffected
+
+  for (;;) {
+    uint32_t t = millis();
+
+    if (netUp()) {
+      if (!wasUp) {                       // just (re)connected
+        wasUp = true;
+        Serial.print("WiFi up: http://"); Serial.println(WiFi.localIP());
+        otaBegin("deskbuddy");            // LAN OTA (browser/IDE) lives on this task
+        lastMsgF = lastDataF = 0;         // force an immediate first fetch
+      }
+      otaHandle();                        // service LAN OTA without touching the UI
+
+      if (messageUrl.length() && (lastMsgF == 0 || t - lastMsgF > MSG_POLL_MS)) {
+        char b[160];
+        if (fetchMessage(messageUrl, b, sizeof(b))) publishMessage(b);
+        lastMsgF = t ? t : 1;
+      }
+      if (lastDataF == 0 || t - lastDataF > NET_REFRESH_MS) {
+        MoonData m = computeMoon(time(nullptr));   // local calc
+        GhData   g = fetchGitHub();                // network
+        publishData(m, g);
+        lastDataF = t ? t : 1;
+      }
+    } else {
+      wasUp = false;
+      if (t - lastTry > WIFI_RETRY_MS) {
+        Serial.println("WiFi: retrying...");
+        WiFi.disconnect();
+        WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+        lastTry = t;
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));        // yield so UI + idle always run
+  }
 }
 
 void setup() {
@@ -168,15 +205,14 @@ void setup() {
   WifiCreds wc = credsLoad();
   wifiSsid = wc.ssid; wifiPass = wc.pass;
   messageUrl = msgUrlLoad();
-
-  // Wi-Fi. OurMane reception is marginal, so this may fail now and succeed later;
-  // the loop retries and runs onWifiConnected() whenever a link comes up.
   WiFi.setAutoReconnect(true);
-  if (netBegin(wifiSsid, wifiPass)) {
-    onWifiConnected();
-  } else {
-    Serial.println("WiFi failed — will keep retrying in the background");
-  }
+
+  // Hand ALL networking to a background task so the display/touch never block on
+  // it. 16KB stack because mbedTLS (HTTPS) is stack-hungry; priority 1 == the
+  // Arduino loop task, so they time-slice and the UI stays smooth.
+  netMx = xSemaphoreCreateMutex();
+  xTaskCreate(netTask, "net", 16384, nullptr, 1, nullptr);
+  Serial.println("networking moved to background task");
 }
 
 void handleGesture(int x, int y, bool pressed) {
@@ -252,29 +288,25 @@ void loop() {
   // ---- battery + brightness dim when idle-dark could go here
   face.setBattery(readBatteryPct());
 
-  // ---- OTA: keep LAN update listeners alive (cheap, non-blocking)
-  if (netUp()) otaHandle();
-
   // ---- Serial provisioning: "wifi <ssid> <pass>" to re-point without a rebuild
   credsSerialTask();
 
-  // ---- Wi-Fi resilience: detect a fresh link, and retry while down
   uint32_t t = millis();
-  if (netUp()) {
-    if (!wifiWasUp) onWifiConnected();     // just (re)connected — run on-connect work
-  } else {
-    wifiWasUp = false;
-    if (t - lastWifiTry > WIFI_RETRY_MS) {
-      Serial.println("WiFi: retrying...");
-      WiFi.disconnect();
-      WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
-      lastWifiTry = t;
-    }
-  }
 
-  // ---- network refresh
-  if (netUp() && t - lastNet > NET_REFRESH_MS) { refreshNetworkData(); lastNet = t; }
-  if (netUp() && t - lastMsg > MSG_POLL_MS)    { pollMessage();        lastMsg = t; }
+  // ---- Drain results the network task fetched (non-blocking: skip if it holds
+  // the lock this instant, pick them up next frame). All face mutation stays
+  // here on the UI thread.
+  char newMsg[160]; bool haveMsg = false, haveData = false;
+  MoonData newMoon; GhData newGh;
+  if (netMx && xSemaphoreTake(netMx, 0) == pdTRUE) {
+    if (netShared.msgReady)  { strlcpy(newMsg, netShared.msg, sizeof(newMsg)); netShared.msgReady = false; haveMsg = true; }
+    if (netShared.dataReady) { newMoon = netShared.moon; newGh = netShared.gh; netShared.dataReady = false; haveData = true; }
+    xSemaphoreGive(netMx);
+  }
+  if (haveMsg && face.setMessage(newMsg)) Serial.printf("[message] NEW: \"%s\"\n", newMsg);
+  if (haveData) { face.setMoon(newMoon); face.setGitHub(newGh); }
+
+  // ---- quote rotation (offline pack — instant, safe on the UI thread)
   if (t - lastQuoteRot > QUOTE_ROTATE_MS) {
     quoteIdx++; char q[160]; fetchQuote(q, sizeof(q), quoteIdx); face.setQuote(q);
     lastQuoteRot = t;

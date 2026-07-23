@@ -120,6 +120,11 @@ private:
   bool msgUnread = false;
   uint32_t msgFlashUntil = 0;   // non-zero while the new-message flash is active
 
+  // Partial-redraw bookkeeping for the face page: the status strip is only
+  // repainted when the battery level or unread badge actually changes.
+  int  lastStatBat = -2;
+  bool lastStatUnread = false;
+
   // GFX_Library_for_Arduino >= 1.4 uses RGB565_* names; the bare WHITE/BLACK
   // aliases were removed. The panel is full-colour (JD9853, 262K colours) — the
   // dashboard is mono by design, but these accents prove colour works and make
@@ -165,30 +170,41 @@ private:
     // Sleepy mood auto-blinks slow & half-closed
     if (mood == MOOD_SLEEPY) blinking = ((now / 400) % 2) == 0;
 
-    gfx->fillScreen(BG);
-    statusStrip();
+    // PARTIAL REDRAW: a full-screen clear + full repaint every frame is ~110KB
+    // over SPI and was the main source of sluggishness. Now the whole screen is
+    // painted only on page entry (`dirty`); animation frames erase just the
+    // eye/mouth box and the status strip only when it changes.
+    bool full = dirty;
+    if (full) {
+      gfx->fillScreen(BG);
+      statusStrip();
+      // Greeting (static): "Hi Pannu", size 2, in the solid band below the face.
+      gfx->setTextColor(FG, BG);
+      gfx->setTextSize(2);
+      gfx->setCursor(cx() - (int)strlen(FACE_GREETING) * 6, SCREEN_H - 30);
+      gfx->print(FACE_GREETING);
+      lastStatBat = batPct; lastStatUnread = msgUnread;
+      dirty = false;
+    } else {
+      // Erase only the animated region (covers both eyes + mouth across the full
+      // range of IMU drift and every mood shape). Keeps header, dots, greeting.
+      gfx->fillRect(64, 40, 194, 100, BG);
+      if (batPct != lastStatBat || msgUnread != lastStatUnread) {
+        statusStrip();                       // refresh battery / unread badge
+        lastStatBat = batPct; lastStatUnread = msgUnread;
+      }
+    }
 
     int eyeY = SCREEN_H / 2 - 20;
     // Eye separation scales with screen width so the face stays proportionate
     // in landscape instead of huddling in the middle of a wide panel.
     int eyeDX = SCREEN_W / 5;
-    int driftX = (int)(tiltX * 14);     // IMU drift
-    int driftY = (int)(tiltY * 14);
-    driftX = constrain(driftX, -10, 10);
-    driftY = constrain(driftY, -8, 8);
+    int driftX = constrain((int)(tiltX * 14), -10, 10);   // IMU drift
+    int driftY = constrain((int)(tiltY * 14), -8, 8);
 
     drawEye(cx() - eyeDX + driftX, eyeY + driftY, blinking, eyeColor());
     drawEye(cx() + eyeDX + driftX, eyeY + driftY, blinking, eyeColor());
     drawMouth(cx(), eyeY + 60, mouthColor());
-
-    // Greeting under the face. Was the mood name ("happy"/"love"/...); now a
-    // fixed message, so the mood is conveyed by the face itself rather than a
-    // word. Size 2 because "Hi Pannu" is the point of the whole device.
-    gfx->setTextColor(FG, BG);
-    gfx->setTextSize(2);
-    const char* tag = FACE_GREETING;
-    gfx->setCursor(cx() - (int)strlen(tag) * 6, SCREEN_H - 30);
-    gfx->print(tag);
   }
 
   const char* moodName() {
