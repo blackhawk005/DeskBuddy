@@ -57,22 +57,14 @@ QMI8658 imu;
 calData calib = {0};
 AccelData accel;
 
-// ---- gesture state
-int  touchStartX = -1, touchStartY = -1;
-// Last position seen while the finger was down. The AXS5106L reports nothing at
-// all on release, so the release edge has to be classified using this instead.
-int  touchLastX = -1, touchLastY = -1;
+// ---- touch state
 bool touchActive = false;
-bool gestureConsumed = false;   // a swipe already fired for this finger-down
-uint32_t touchT0 = 0;
 // Time of the last frame in which the controller actually reported a point.
 uint32_t lastTouchMs = 0;
 // How long the controller must stay silent before we call it a finger lift.
-// Must exceed the AXS5106L's quiet gap between interrupts during a held press.
+// Must exceed the AXS5106L's quiet gap between polls during a held press, so one
+// physical tap = one action even though the controller drops frames.
 #define TOUCH_RELEASE_MS 120
-// Horizontal travel (screen px) that counts as a page swipe. Lower = easier.
-// Fires MID-DRAG, not on release, so navigation feels immediate.
-#define SWIPE_THRESHOLD 26
 
 // ---- quote rotation (offline pack, cheap — stays on the UI task)
 uint32_t lastQuoteRot = 0;
@@ -199,13 +191,6 @@ void setup() {
     Serial.println("touch: polling AXS5106L at 0x63 (INT line unused)");
   #endif
 
-  // Optional physical nav buttons (safe no-op if nothing is wired).
-  #if BTN_LEFT  >= 0
-    pinMode(BTN_LEFT,  INPUT_PULLUP);
-  #endif
-  #if BTN_RIGHT >= 0
-    pinMode(BTN_RIGHT, INPUT_PULLUP);
-  #endif
 
   Serial.printf("firmware version: %s\n", FW_VERSION);
 
@@ -223,60 +208,24 @@ void setup() {
   Serial.println("networking moved to background task");
 }
 
-// Debounced edge-detect for a momentary button wired to GND (INPUT_PULLUP, so
-// LOW = pressed). Returns true once per press. Coexists with touch — either can
-// drive navigation.
-bool buttonPressed(uint8_t pin, bool& prev, uint32_t& tEdge) {
-  bool now = digitalRead(pin);
-  if (now == prev) return false;
-  if (millis() - tEdge < 30) return false;      // debounce window
-  tEdge = millis();
-  prev = now;
-  return (now == LOW);                          // fire on the press edge only
-}
-
-void handleButtons() {
-  #if BTN_LEFT >= 0
-    static bool pL = HIGH; static uint32_t tL = 0;
-    if (buttonPressed(BTN_LEFT, pL, tL))  { face.prevPage(); Serial.println("[btn] LEFT -> prev"); }
-  #endif
-  #if BTN_RIGHT >= 0
-    static bool pR = HIGH; static uint32_t tR = 0;
-    if (buttonPressed(BTN_RIGHT, pR, tR)) { face.nextPage(); Serial.println("[btn] RIGHT -> next"); }
-  #endif
-}
-
+// Touch-zone navigation. Acts on the touch-DOWN edge (snappiest possible), by
+// which third of the screen was tapped. The touchActive flag + the release
+// debounce in loop() guarantee exactly one action per physical tap even though
+// the AXS5106L drops frames mid-touch.
 void handleGesture(int x, int y, bool pressed) {
-  if (pressed && !touchActive) {                 // touch down
-    touchActive = true; gestureConsumed = false;
-    touchStartX = x; touchStartY = y; touchT0 = millis();
-    touchLastX = x; touchLastY = y;
-  } else if (pressed && touchActive) {           // still down
-    touchLastX = x; touchLastY = y;
-    // Fire the swipe THE MOMENT the finger has travelled far enough, instead of
-    // waiting for release. This is the responsiveness fix — the old code only
-    // classified on release, so a swipe that didn't lift cleanly did nothing.
-    if (!gestureConsumed) {
-      int dx = x - touchStartX, dy = y - touchStartY;
-      if (abs(dx) >= SWIPE_THRESHOLD && abs(dx) > abs(dy)) {
-        if (dx < 0) face.nextPage(); else face.prevPage();
-        gestureConsumed = true;                  // one page-turn per finger-down
-        Serial.printf("[touch] swipe dx=%d -> page %d\n", dx, (int)face.getPage());
-      }
+  if (pressed && !touchActive) {                 // touch DOWN -> act now
+    touchActive = true;
+    if (x < ZONE_LEFT_MAX) {
+      face.prevPage();  Serial.printf("[touch] LEFT@%d -> prev (page %d)\n", x, (int)face.getPage());
+    } else if (x > ZONE_RIGHT_MIN) {
+      face.nextPage();  Serial.printf("[touch] RIGHT@%d -> next (page %d)\n", x, (int)face.getPage());
+    } else {                                     // center third = select
+      if (face.getPage() == PAGE_FACE) face.cycleMood();
+      else face.setPage(PAGE_FACE);
+      Serial.printf("[touch] CENTER@%d -> mood/home\n", x);
     }
-  } else if (!pressed && touchActive) {          // release
+  } else if (!pressed && touchActive) {          // released -> ready for next tap
     touchActive = false;
-    if (gestureConsumed) return;                 // already handled as a swipe
-    int dx = touchLastX - touchStartX, dy = touchLastY - touchStartY;
-    uint32_t dt = millis() - touchT0;
-    // Anything that didn't become a swipe and stayed roughly put is a tap.
-    if (abs(dx) < SWIPE_THRESHOLD && abs(dy) < SWIPE_THRESHOLD && dt < 600) {
-      if (face.getPage() == PAGE_FACE) face.cycleMood();     // tap face -> mood
-      else face.setPage(PAGE_FACE);                          // tap elsewhere -> home
-      Serial.printf("[touch] tap at %d,%d\n", touchLastX, touchLastY);
-    } else {
-      Serial.printf("[touch] ignored dx=%d dy=%d dt=%lums\n", dx, dy, (unsigned long)dt);
-    }
   }
 }
 
@@ -292,21 +241,16 @@ void loop() {
     // Two-step in this library: bsp_touch_read() polls the controller, then
     // bsp_touch_get_coordinates() reports whether a valid point is available.
     //
-    // IMPORTANT: bsp_touch_read() zeroes touch_num on every call and only
-    // refills it when the AXS5106L's INT line has fired since the last read.
-    // The controller does NOT interrupt on every one of our ~33ms loops, so a
-    // finger held still reports "no touch" on most iterations. Treating each of
-    // those as a release ends the gesture instantly and makes every swipe
-    // register as a tap. So only declare a release after the controller has
-    // been quiet for TOUCH_RELEASE_MS.
+    // IMPORTANT: the AXS5106L drops frames — a finger held still reports "no
+    // touch" on many polls. Treating each gap as a release would let one tap
+    // fire repeatedly, so a release is only declared after TOUCH_RELEASE_MS of
+    // real silence. That gives exactly one zone action per physical tap.
     uint16_t tx = 0, ty = 0;
     if (touchPoll(&tx, &ty)) {
       lastTouchMs = millis();
-      handleGesture(tx, ty, true);
+      handleGesture(tx, ty, true);           // acts on the touch-down edge
     } else if (touchActive && millis() - lastTouchMs > TOUCH_RELEASE_MS) {
-      // Genuinely lifted. handleGesture() ignores the coordinates here and
-      // classifies the gesture from touchStartX/Y vs touchLastX/Y.
-      handleGesture(0, 0, false);
+      handleGesture(0, 0, false);            // genuine lift — arm the next tap
     }
   #else
     // Fallback: BOOT button (GPIO9) cycles pages
@@ -315,9 +259,6 @@ void loop() {
     if (prev && !now) face.nextPage();
     prev = now;
   #endif
-
-  // ---- physical nav buttons (coexist with touch)
-  handleButtons();
 
   // ---- battery + brightness dim when idle-dark could go here
   face.setBattery(readBatteryPct());
