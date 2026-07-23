@@ -60,16 +60,40 @@ int  touchStartX = -1, touchStartY = -1;
 // all on release, so the release edge has to be classified using this instead.
 int  touchLastX = -1, touchLastY = -1;
 bool touchActive = false;
+bool gestureConsumed = false;   // a swipe already fired for this finger-down
 uint32_t touchT0 = 0;
 // Time of the last frame in which the controller actually reported a point.
 uint32_t lastTouchMs = 0;
 // How long the controller must stay silent before we call it a finger lift.
 // Must exceed the AXS5106L's quiet gap between interrupts during a held press.
 #define TOUCH_RELEASE_MS 120
+// Horizontal travel (screen px) that counts as a page swipe. Lower = easier.
+// Fires MID-DRAG, not on release, so navigation feels immediate.
+#define SWIPE_THRESHOLD 26
 
 // ---- network scheduler
-uint32_t lastNet = 0, lastQuoteRot = 0;
+uint32_t lastNet = 0, lastQuoteRot = 0, lastMsg = 0;
 int quoteIdx = 0;
+
+// ---- live message feed
+String messageUrl;            // provisioned from NVS at boot (secret token inside)
+#define MSG_POLL_MS (30UL * 1000UL)   // check for a new message every 30s
+
+// ---- Wi-Fi creds held for reconnect attempts (loaded once from NVS)
+String wifiSsid, wifiPass;
+bool   wifiWasUp = false;
+uint32_t lastWifiTry = 0;
+#define WIFI_RETRY_MS (20UL * 1000UL)
+
+void pollMessage() {
+  if (messageUrl.length() == 0) return;
+  char buf[160];
+  if (fetchMessage(messageUrl, buf, sizeof(buf))) {
+    if (face.setMessage(buf)) {          // true only when the text changed
+      Serial.printf("[message] NEW: \"%s\"\n", buf);   // notify (serial + on-screen)
+    }
+  }
+}
 
 // ---- battery
 int readBatteryPct() {
@@ -85,6 +109,18 @@ void refreshNetworkData() {
   MoonData m = computeMoon(time(nullptr)); face.setMoon(m);
   GhData g = fetchGitHub();        face.setGitHub(g);
   char q[160]; fetchQuote(q, sizeof(q), quoteIdx); face.setQuote(q);
+}
+
+// Runs once each time a Wi-Fi link is established — at boot or on a later
+// reconnect. Idempotent, so calling it again on every reconnect is fine.
+void onWifiConnected() {
+  wifiWasUp = true;
+  Serial.print("WiFi up: http://"); Serial.println(WiFi.localIP());
+  otaBegin("deskbuddy");            // LAN OTA: browser + Arduino IDE network port
+  delay(200);
+  refreshNetworkData();  lastNet = millis();
+  pollMessage();         lastMsg = millis();
+  otaCheckOnce();                   // pull-OTA: adopt a newer GitHub release now
 }
 
 void setup() {
@@ -126,38 +162,46 @@ void setup() {
 
   Serial.printf("firmware version: %s\n", FW_VERSION);
 
-  // Wi-Fi creds come from NVS (survive OTA), not compile-time macros.
+  // Wi-Fi creds and message URL come from NVS (survive OTA), not compile-time.
   WifiCreds wc = credsLoad();
+  wifiSsid = wc.ssid; wifiPass = wc.pass;
+  messageUrl = msgUrlLoad();
 
-  // Wi-Fi (non-fatal — device works offline with the built-in quote pack)
-  if (netBegin(wc.ssid, wc.pass)) {
-    Serial.println("WiFi up");
-    Serial.print("DeskBuddy IP (open in browser to update): http://");
-    Serial.println(WiFi.localIP());
-    otaBegin("deskbuddy");          // LAN OTA: browser + Arduino IDE network port
-    delay(300);
-    refreshNetworkData();
-    lastNet = millis();
-    otaCheckOnce();                 // pull-OTA: adopt a newer GitHub release now
+  // Wi-Fi. OurMane reception is marginal, so this may fail now and succeed later;
+  // the loop retries and runs onWifiConnected() whenever a link comes up.
+  WiFi.setAutoReconnect(true);
+  if (netBegin(wifiSsid, wifiPass)) {
+    onWifiConnected();
   } else {
-    Serial.println("WiFi failed — running offline (OTA unavailable until connected)");
+    Serial.println("WiFi failed — will keep retrying in the background");
   }
 }
 
 void handleGesture(int x, int y, bool pressed) {
-  if (pressed && !touchActive) {          // touch down
-    touchActive = true; touchStartX = x; touchStartY = y; touchT0 = millis();
+  if (pressed && !touchActive) {                 // touch down
+    touchActive = true; gestureConsumed = false;
+    touchStartX = x; touchStartY = y; touchT0 = millis();
     touchLastX = x; touchLastY = y;
-  } else if (pressed && touchActive) {    // still down — remember where we are
+  } else if (pressed && touchActive) {           // still down
     touchLastX = x; touchLastY = y;
-  } else if (!pressed && touchActive) {   // release
+    // Fire the swipe THE MOMENT the finger has travelled far enough, instead of
+    // waiting for release. This is the responsiveness fix — the old code only
+    // classified on release, so a swipe that didn't lift cleanly did nothing.
+    if (!gestureConsumed) {
+      int dx = x - touchStartX, dy = y - touchStartY;
+      if (abs(dx) >= SWIPE_THRESHOLD && abs(dx) > abs(dy)) {
+        if (dx < 0) face.nextPage(); else face.prevPage();
+        gestureConsumed = true;                  // one page-turn per finger-down
+        Serial.printf("[touch] swipe dx=%d -> page %d\n", dx, (int)face.getPage());
+      }
+    }
+  } else if (!pressed && touchActive) {          // release
     touchActive = false;
+    if (gestureConsumed) return;                 // already handled as a swipe
     int dx = touchLastX - touchStartX, dy = touchLastY - touchStartY;
     uint32_t dt = millis() - touchT0;
-    if (abs(dx) > 40 && abs(dx) > abs(dy)) {          // horizontal swipe -> page
-      if (dx < 0) face.nextPage(); else face.prevPage();
-      Serial.printf("[touch] swipe dx=%d -> page %d\n", dx, (int)face.getPage());
-    } else if (abs(dx) < 20 && abs(dy) < 20 && dt < 400) {  // tap
+    // Anything that didn't become a swipe and stayed roughly put is a tap.
+    if (abs(dx) < SWIPE_THRESHOLD && abs(dy) < SWIPE_THRESHOLD && dt < 600) {
       if (face.getPage() == PAGE_FACE) face.cycleMood();     // tap face -> mood
       else face.setPage(PAGE_FACE);                          // tap elsewhere -> home
       Serial.printf("[touch] tap at %d,%d\n", touchLastX, touchLastY);
@@ -215,9 +259,23 @@ void loop() {
   // ---- Serial provisioning: "wifi <ssid> <pass>" to re-point without a rebuild
   credsSerialTask();
 
-  // ---- network refresh
+  // ---- Wi-Fi resilience: detect a fresh link, and retry while down
   uint32_t t = millis();
+  if (netUp()) {
+    if (!wifiWasUp) onWifiConnected();     // just (re)connected — run on-connect work
+  } else {
+    wifiWasUp = false;
+    if (t - lastWifiTry > WIFI_RETRY_MS) {
+      Serial.println("WiFi: retrying...");
+      WiFi.disconnect();
+      WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+      lastWifiTry = t;
+    }
+  }
+
+  // ---- network refresh
   if (netUp() && t - lastNet > NET_REFRESH_MS) { refreshNetworkData(); lastNet = t; }
+  if (netUp() && t - lastMsg > MSG_POLL_MS)    { pollMessage();        lastMsg = t; }
   if (t - lastQuoteRot > QUOTE_ROTATE_MS) {
     quoteIdx++; char q[160]; fetchQuote(q, sizeof(q), quoteIdx); face.setQuote(q);
     lastQuoteRot = t;

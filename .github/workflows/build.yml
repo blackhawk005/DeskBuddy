@@ -50,6 +50,7 @@ jobs:
           #define WIFI_PASS   ""
           #define OTA_PASSWORD ""
           #define QUOTES_URL  ""
+          #define MESSAGE_URL ""
           EOF
 
       - name: Compile

@@ -9,8 +9,8 @@
 #include "net.h"
 
 // Page indices for swipe navigation. Weather removed per owner request
-// 2026-07-23 — dropping it here also removes its navigation dot automatically.
-enum Page { PAGE_FACE, PAGE_CLOCK, PAGE_DATE, PAGE_MOON,
+// 2026-07-23. PAGE_MESSAGE added same day — live message feed from an endpoint.
+enum Page { PAGE_FACE, PAGE_MESSAGE, PAGE_CLOCK, PAGE_DATE, PAGE_MOON,
             PAGE_QUOTE, PAGE_GITHUB, PAGE_COUNT };
 
 // Moods set by tap
@@ -69,6 +69,22 @@ public:
   void setQuote(const char* q)     { strlcpy(quote, q, sizeof(quote)); if (page==PAGE_QUOTE) dirty=true; }
   void setBattery(int pct)         { batPct = pct; }
 
+  // --- live message feed
+  // Store a freshly-fetched message. If the text differs from what is on screen,
+  // it's NEW: raise the unread flag, jump to the message page to show it, and
+  // flash once so it's noticed. Returns true if it was a new message.
+  bool setMessage(const char* m) {
+    if (strncmp(m, message, sizeof(message)) == 0) return false;  // unchanged
+    strlcpy(message, m, sizeof(message));
+    hasMessage = true;
+    msgUnread = true;
+    msgFlashUntil = millis() + 1200;      // brief attention flash
+    setPage(PAGE_MESSAGE);                // bring it to the front
+    dirty = true;
+    return true;
+  }
+  bool messageUnread() const { return msgUnread; }
+
   // --- main render tick
   void tick() {
     uint32_t now = millis();
@@ -78,6 +94,7 @@ public:
       case PAGE_DATE:  if (dirty) { renderDate(); dirty=false; } break;
       case PAGE_MOON:    if (dirty) { renderMoon(); dirty=false; } break;
       case PAGE_QUOTE:   if (dirty) { renderQuote(); dirty=false; } break;
+      case PAGE_MESSAGE: if (dirty || msgFlashUntil) { renderMessage(now); if (!msgFlashUntil) dirty=false; } break;
       case PAGE_GITHUB:  if (dirty) { renderGitHub(); dirty=false; } break;
       default: break;
     }
@@ -97,9 +114,19 @@ private:
   WxData wx; MoonData moon; GhData gh;
   char quote[160] = "You are my favorite notification.";
 
+  // Live message state.
+  char message[160] = "";
+  bool hasMessage = false;
+  bool msgUnread = false;
+  uint32_t msgFlashUntil = 0;   // non-zero while the new-message flash is active
+
   // GFX_Library_for_Arduino >= 1.4 uses RGB565_* names; the bare WHITE/BLACK
-  // aliases were removed.
-  static const uint16_t FG = RGB565_WHITE, BG = RGB565_BLACK;
+  // aliases were removed. The panel is full-colour (JD9853, 262K colours) — the
+  // dashboard is mono by design, but these accents prove colour works and make
+  // the message/notification stand out.
+  static const uint16_t FG    = RGB565_WHITE, BG = RGB565_BLACK;
+  static const uint16_t ACCENT = RGB565_CYAN;    // message text
+  static const uint16_t ALERT  = RGB565_RED;     // unread badge
   int cx() { return SCREEN_W / 2; }
 
   // ---- status strip (battery + page dots) drawn on every page
@@ -113,6 +140,9 @@ private:
       int fill = (bw - 4) * batPct / 100;
       gfx->fillRect(bx + 2, by + 2, fill, bh - 4, FG);
     }
+    // unread-message badge (red dot, top-left) — visible from every page until
+    // the message page is opened.
+    if (msgUnread) gfx->fillCircle(8, 7, 4, ALERT);
     // page dots bottom
     int dots = PAGE_COUNT, gap = 12, tot = dots * gap;
     int sx = cx() - tot / 2 + gap / 2;
@@ -288,38 +318,51 @@ private:
     bigText(il, SCREEN_H/2 + 58, 1);
   }
 
-  void renderQuote() {
-    header("FOR YOU");
-    // Size 2 (12px glyphs) instead of 1 — this page is the point of the gift,
-    // so it should be readable across the desk, not squinted at.
-    const uint8_t sz = 2;
-    const int charW = 6 * sz, lineh = 8 * sz + 4;
-    gfx->setTextColor(FG, BG); gfx->setTextSize(sz);
-    int x0 = 10, maxw = SCREEN_W - 20;
-    char tmp[160]; strlcpy(tmp, quote, sizeof(tmp));
+  // Word-wrap `text` at size `sz` and draw it centred (each line, and the block
+  // vertically) in the area below the header. Shared by the quote and message
+  // pages so both stay readable across the desk.
+  void drawWrappedBlock(const char* text, uint8_t sz, uint16_t color) {
+    const int charW = 6 * sz, lineh = 8 * sz + 4, maxw = SCREEN_W - 20;
+    gfx->setTextColor(color, BG); gfx->setTextSize(sz);
+    char tmp[160]; strlcpy(tmp, text, sizeof(tmp));
 
-    // First pass: word-wrap into lines so we can vertically centre the block
-    // in the space below the header (bigger text makes off-centre look wrong).
     String lines[8]; int nLines = 0;
     char* word = strtok(tmp, " ");
     String line = "";
     while (word && nLines < 8) {
       String test = line.length() ? line + " " + word : String(word);
-      if ((int)test.length() * charW > maxw) {
-        lines[nLines++] = line; line = word;
-      } else line = test;
+      if ((int)test.length() * charW > maxw) { lines[nLines++] = line; line = word; }
+      else line = test;
       word = strtok(nullptr, " ");
     }
     if (line.length() && nLines < 8) lines[nLines++] = line;
 
-    int blockH = nLines * lineh;
-    int y = 34 + ((SCREEN_H - 34) - blockH) / 2;   // centre below the header
+    int y = 34 + ((SCREEN_H - 34) - nLines * lineh) / 2;
     for (int i = 0; i < nLines; i++) {
       int w = (int)lines[i].length() * charW;
-      gfx->setCursor((SCREEN_W - w) / 2, y);       // centre each line too
+      gfx->setCursor((SCREEN_W - w) / 2, y);
       gfx->print(lines[i]);
       y += lineh;
     }
+  }
+
+  void renderQuote() {
+    header("FOR YOU");
+    drawWrappedBlock(quote, 2, FG);
+  }
+
+  // Live message page. Cyan text (colour, to stand out from the mono UI). While
+  // a new message is flashing, the header pulses so it grabs attention; once the
+  // flash ends the message is marked read and the red badge clears.
+  void renderMessage(uint32_t now) {
+    bool flashing = msgFlashUntil && now < msgFlashUntil;
+    if (msgFlashUntil && now >= msgFlashUntil) { msgFlashUntil = 0; msgUnread = false; }
+
+    header(flashing && ((now / 250) % 2) ? "* NEW MESSAGE *" : "MESSAGE");
+    if (!hasMessage) { drawWrappedBlock("waiting for a message...", 2, FG); return; }
+    drawWrappedBlock(message, 2, ACCENT);
+    // Viewing the page clears the unread state even without a flash.
+    if (!flashing) msgUnread = false;
   }
 
   void renderGitHub() {

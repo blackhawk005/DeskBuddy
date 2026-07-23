@@ -45,6 +45,20 @@ inline WifiCreds credsLoad() {
   return c;
 }
 
+// Message-feed URL, same NVS pattern as Wi-Fi creds so its secret token never
+// lands in a public binary. Provisioned once from secrets.h MESSAGE_URL.
+inline String msgUrlLoad() {
+  credsStore().begin("deskbuddy", false);
+  String url = credsStore().getString("msgurl", "");
+  if (url.length() == 0 && strlen(MESSAGE_URL) > 0) {
+    url = MESSAGE_URL;
+    credsStore().putString("msgurl", url);
+    Serial.println("creds: provisioned message URL into NVS from secrets.h");
+  }
+  credsStore().end();
+  return url;
+}
+
 // Re-provision from a serial command, no recompile needed.
 inline void credsSet(const String& ssid, const String& pass) {
   credsStore().begin("deskbuddy", false);
@@ -65,6 +79,11 @@ inline void credsSerialTask() {
         int sp = buf.indexOf(' ', 5);
         if (sp > 0) credsSet(buf.substring(5, sp), buf.substring(sp + 1));
         else Serial.println("usage: wifi <ssid> <password>");
+      } else if (buf.startsWith("msgurl ")) {
+        credsStore().begin("deskbuddy", false);
+        credsStore().putString("msgurl", buf.substring(7));
+        credsStore().end();
+        Serial.println("creds: message URL saved to NVS (reboot to apply)");
       }
       buf = "";
     } else if (buf.length() < 128) {

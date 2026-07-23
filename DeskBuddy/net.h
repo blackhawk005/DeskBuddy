@@ -90,6 +90,28 @@ inline WxData fetchWeather() {
   return w;
 }
 
+// ------------------------------------------------------------ Live message feed
+// Fetches the plain-text body from `url` (provisioned in NVS, see credentials.h).
+// Returns true and fills `out` on success; leaves `out` untouched on failure so
+// the last good message stays on screen.
+inline bool fetchMessage(const String& url, char* out, size_t outSize) {
+  if (!netUp() || url.length() == 0) return false;
+  WiFiClientSecure client;
+  client.setInsecure();                    // no CA bundle on-device
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  http.setTimeout(8000);
+  if (!http.begin(client, url)) return false;
+  bool ok = false;
+  if (http.GET() == 200) {
+    String body = http.getString();
+    body.trim();
+    if (body.length() > 0) { strlcpy(out, body.c_str(), outSize); ok = true; }
+  }
+  http.end();
+  return ok;
+}
+
 // Map WMO weather codes to a compact label for the mono dashboard.
 inline const char* wxLabel(int code) {
   if (code < 0) return "—";
