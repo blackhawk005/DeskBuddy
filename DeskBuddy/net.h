@@ -100,7 +100,8 @@ inline bool fetchMessage(const String& url, char* out, size_t outSize) {
   client.setInsecure();                    // no CA bundle on-device
   HTTPClient http;
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-  http.setTimeout(8000);
+  http.setConnectTimeout(3000);            // cap the UI freeze on a bad network
+  http.setTimeout(4000);
   if (!http.begin(client, url)) return false;
   bool ok = false;
   if (http.GET() == 200) {

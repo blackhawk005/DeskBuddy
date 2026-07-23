@@ -177,9 +177,9 @@ private:
     driftX = constrain(driftX, -10, 10);
     driftY = constrain(driftY, -8, 8);
 
-    drawEye(cx() - eyeDX + driftX, eyeY + driftY, blinking);
-    drawEye(cx() + eyeDX + driftX, eyeY + driftY, blinking);
-    drawMouth(cx(), eyeY + 60);
+    drawEye(cx() - eyeDX + driftX, eyeY + driftY, blinking, eyeColor());
+    drawEye(cx() + eyeDX + driftX, eyeY + driftY, blinking, eyeColor());
+    drawMouth(cx(), eyeY + 60, mouthColor());
 
     // Greeting under the face. Was the mood name ("happy"/"love"/...); now a
     // fixed message, so the mood is conveyed by the face itself rather than a
@@ -201,31 +201,52 @@ private:
     }
   }
 
-  void drawEye(int x, int y, bool blinking) {
-    if (blinking) { gfx->drawFastHLine(x - 12, y, 24, FG); return; }
+  // Per-mood colours (the panel is full RGB). Eyes stay white for the calm moods
+  // (neutral, happy) as requested; the expressive moods tint — love = red heart,
+  // surprised = orange, sleepy = blue. The mouth always carries the mood colour.
+  uint16_t eyeColor() {
     switch (mood) {
-      case MOOD_LOVE: {                 // heart-ish eyes
-        gfx->fillCircle(x - 5, y - 3, 6, FG);
-        gfx->fillCircle(x + 5, y - 3, 6, FG);
-        gfx->fillTriangle(x - 11, y, x + 11, y, x, y + 12, FG);
+      case MOOD_LOVE:      return RGB565_RED;
+      case MOOD_SURPRISED: return RGB565_ORANGE;
+      case MOOD_SLEEPY:    return RGB565_BLUE;
+      default:             return FG;           // white: neutral + happy
+    }
+  }
+  uint16_t mouthColor() {
+    switch (mood) {
+      case MOOD_LOVE:      return RGB565_RED;
+      case MOOD_HAPPY:     return RGB565_YELLOW;
+      case MOOD_SURPRISED: return RGB565_ORANGE;
+      case MOOD_SLEEPY:    return RGB565_BLUE;
+      default:             return FG;           // white: neutral
+    }
+  }
+
+  void drawEye(int x, int y, bool blinking, uint16_t col) {
+    if (blinking) { gfx->drawFastHLine(x - 12, y, 24, col); return; }
+    switch (mood) {
+      case MOOD_LOVE: {                 // heart-ish eyes (red)
+        gfx->fillCircle(x - 5, y - 3, 6, col);
+        gfx->fillCircle(x + 5, y - 3, 6, col);
+        gfx->fillTriangle(x - 11, y, x + 11, y, x, y + 12, col);
       } break;
       case MOOD_SURPRISED:
-        gfx->drawCircle(x, y, 14, FG); gfx->drawCircle(x, y, 13, FG);
-        gfx->fillCircle(x, y, 4, FG); break;
+        gfx->drawCircle(x, y, 14, col); gfx->drawCircle(x, y, 13, col);
+        gfx->fillCircle(x, y, 4, col); break;
       case MOOD_HAPPY:                  // upward arcs
-        gfx->drawFastHLine(x - 12, y + 4, 24, FG);
-        gfx->drawFastHLine(x - 9,  y + 1, 18, FG);
-        gfx->drawFastHLine(x - 5,  y - 2, 10, FG); break;
+        gfx->drawFastHLine(x - 12, y + 4, 24, col);
+        gfx->drawFastHLine(x - 9,  y + 1, 18, col);
+        gfx->drawFastHLine(x - 5,  y - 2, 10, col); break;
       case MOOD_SLEEPY:
-        gfx->drawFastHLine(x - 12, y, 24, FG);
-        gfx->drawFastHLine(x - 10, y + 3, 20, FG); break;
+        gfx->drawFastHLine(x - 12, y, 24, col);
+        gfx->drawFastHLine(x - 10, y + 3, 20, col); break;
       default:                          // neutral round
-        gfx->fillCircle(x, y, 13, FG);
+        gfx->fillCircle(x, y, 13, col);
         gfx->fillCircle(x + (tiltX>0?3:-3), y + (tiltY>0?3:-3), 4, BG);
     }
   }
 
-  void drawMouth(int x, int y) {
+  void drawMouth(int x, int y, uint16_t col) {
     switch (mood) {
       case MOOD_HAPPY: case MOOD_LOVE:
         // Smile = U-shaped: centre BELOW the corners. y grows downward, so the
@@ -233,14 +254,14 @@ private:
         // centre above the corners and drew a frown for the "happy" mood.)
         for (int i = -18; i <= 18; i++) {
           int yy = y - (int)(0.03f * i * i) + 6;
-          gfx->drawPixel(x + i, yy, FG); gfx->drawPixel(x + i, yy + 1, FG);
+          gfx->drawPixel(x + i, yy, col); gfx->drawPixel(x + i, yy + 1, col);
         } break;
       case MOOD_SURPRISED:
-        gfx->drawCircle(x, y + 2, 8, FG); break;
+        gfx->drawCircle(x, y + 2, 8, col); break;
       case MOOD_SLEEPY:
-        gfx->drawFastHLine(x - 8, y, 16, FG); break;
+        gfx->drawFastHLine(x - 8, y, 16, col); break;
       default:
-        gfx->drawFastHLine(x - 12, y, 24, FG);
+        gfx->drawFastHLine(x - 12, y, 24, col);
     }
   }
 

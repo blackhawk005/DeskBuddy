@@ -29,8 +29,11 @@
 #include "clockseed.h"
 #include "face.h"
 #include "net.h"
-#include "ota.h"
-#include "otapull.h"     // pull-based OTA from GitHub Releases
+#include "ota.h"          // LAN OTA (browser/IDE upload) — the "update whenever" path
+// Auto-update (pull-OTA from GitHub) removed 2026-07-23 at owner's request:
+// updates are infrequent and the board is physically accessible, and the
+// periodic network check added latency. Update now via USB flash or the LAN OTA
+// page at the device's IP. (former: #include "otapull.h")
 
 #if USE_TOUCH
   // Was Waveshare's esp_lcd_touch_axs5106l. Replaced by our own polling reader:
@@ -120,7 +123,6 @@ void onWifiConnected() {
   delay(200);
   refreshNetworkData();  lastNet = millis();
   pollMessage();         lastMsg = millis();
-  otaCheckOnce();                   // pull-OTA: adopt a newer GitHub release now
 }
 
 void setup() {
@@ -252,9 +254,6 @@ void loop() {
 
   // ---- OTA: keep LAN update listeners alive (cheap, non-blocking)
   if (netUp()) otaHandle();
-
-  // ---- Pull-OTA: self-throttled check for a newer GitHub release
-  if (netUp()) otaTask();
 
   // ---- Serial provisioning: "wifi <ssid> <pass>" to re-point without a rebuild
   credsSerialTask();
