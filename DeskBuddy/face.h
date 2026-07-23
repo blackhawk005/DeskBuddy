@@ -71,16 +71,15 @@ public:
 
   // --- live message feed
   // Store a freshly-fetched message. If the text differs from what is on screen,
-  // it's NEW: raise the unread flag, jump to the message page to show it, and
-  // flash once so it's noticed. Returns true if it was a new message.
+  // it's NEW: raise the unread flag. It does NOT auto-navigate — instead the
+  // home (face) greeting changes to announce the message and the red badge
+  // lights, until the user opens the MESSAGE page. Returns true if it was new.
   bool setMessage(const char* m) {
     if (strncmp(m, message, sizeof(message)) == 0) return false;  // unchanged
     strlcpy(message, m, sizeof(message));
     hasMessage = true;
     msgUnread = true;
-    msgFlashUntil = millis() + 1200;      // brief attention flash
-    setPage(PAGE_MESSAGE);                // bring it to the front
-    dirty = true;
+    if (page == PAGE_FACE) dirty = true;  // refresh the home greeting right away
     return true;
   }
   bool messageUnread() const { return msgUnread; }
@@ -94,7 +93,7 @@ public:
       case PAGE_DATE:  if (dirty) { renderDate(); dirty=false; } break;
       case PAGE_MOON:    if (dirty) { renderMoon(); dirty=false; } break;
       case PAGE_QUOTE:   if (dirty) { renderQuote(); dirty=false; } break;
-      case PAGE_MESSAGE: if (dirty || msgFlashUntil) { renderMessage(now); if (!msgFlashUntil) dirty=false; } break;
+      case PAGE_MESSAGE: if (dirty) { renderMessage(); dirty=false; } break;
       case PAGE_GITHUB:  if (dirty) { renderGitHub(); dirty=false; } break;
       default: break;
     }
@@ -118,7 +117,6 @@ private:
   char message[160] = "";
   bool hasMessage = false;
   bool msgUnread = false;
-  uint32_t msgFlashUntil = 0;   // non-zero while the new-message flash is active
 
   // Partial-redraw bookkeeping for the face page: the status strip is only
   // repainted when the battery level or unread badge actually changes.
@@ -157,6 +155,20 @@ private:
     }
   }
 
+  // Greeting line under the face. Normally "Hi Pannu"; while a message is unread
+  // it becomes the notification (in cyan so it stands out), reverting once the
+  // message is opened. Auto-sizes down to size 1 when the longer text needs it.
+  void drawGreeting() {
+    const char* g = msgUnread ? MSG_GREETING : FACE_GREETING;
+    int len = (int)strlen(g);
+    uint8_t sz = (len * 12 <= SCREEN_W - 8) ? 2 : 1;    // size 2 if it fits, else 1
+    int charW = 6 * sz, charH = 8 * sz;
+    gfx->setTextSize(sz);
+    gfx->setTextColor(msgUnread ? ACCENT : FG, BG);
+    gfx->setCursor((SCREEN_W - len * charW) / 2, SCREEN_H - 12 - charH);
+    gfx->print(g);
+  }
+
   // ============================ FACE ============================
   void renderFace(uint32_t now) {
     // Blink scheduling
@@ -178,11 +190,7 @@ private:
     if (full) {
       gfx->fillScreen(BG);
       statusStrip();
-      // Greeting (static): "Hi Pannu", size 2, in the solid band below the face.
-      gfx->setTextColor(FG, BG);
-      gfx->setTextSize(2);
-      gfx->setCursor(cx() - (int)strlen(FACE_GREETING) * 6, SCREEN_H - 30);
-      gfx->print(FACE_GREETING);
+      drawGreeting();
       lastStatBat = batPct; lastStatUnread = msgUnread;
       dirty = false;
     } else {
@@ -388,18 +396,14 @@ private:
     drawWrappedBlock(quote, 2, FG);
   }
 
-  // Live message page. Cyan text (colour, to stand out from the mono UI). While
-  // a new message is flashing, the header pulses so it grabs attention; once the
-  // flash ends the message is marked read and the red badge clears.
-  void renderMessage(uint32_t now) {
-    bool flashing = msgFlashUntil && now < msgFlashUntil;
-    if (msgFlashUntil && now >= msgFlashUntil) { msgFlashUntil = 0; msgUnread = false; }
-
-    header(flashing && ((now / 250) % 2) ? "* NEW MESSAGE *" : "MESSAGE");
+  // Live message page. Cyan text so it stands out from the mono UI. Opening this
+  // page counts as "seen": clear the unread flag first (before drawing) so the
+  // red badge doesn't paint here, and so returning home shows "Hi Pannu" again.
+  void renderMessage() {
+    msgUnread = false;
+    header("MESSAGE");
     if (!hasMessage) { drawWrappedBlock("waiting for a message...", 2, FG); return; }
     drawWrappedBlock(message, 2, ACCENT);
-    // Viewing the page clears the unread state even without a flash.
-    if (!flashing) msgUnread = false;
   }
 
   void renderGitHub() {

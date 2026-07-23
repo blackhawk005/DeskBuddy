@@ -81,8 +81,11 @@
 #define WX_LON -121.8863
 #define WX_TZ   "America/Los_Angeles"
 
-// ---- Greeting shown under the face (replaces the old mood name)
+// ---- Greeting shown under the face
+// Normal greeting, and the notification shown instead while a message is unread
+// (reverts to FACE_GREETING once the MESSAGE page is opened).
 #define FACE_GREETING "Hi Pannu"
+#define MSG_GREETING  "Hi Pannu, you have a message from Shinti"
 
 // ---- Touch-zone navigation
 // The screen splits into three vertical tap zones (no swipe, no hardware):
