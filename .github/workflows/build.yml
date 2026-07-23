@@ -1,0 +1,74 @@
+name: build-and-release
+
+# Every push to main compiles the firmware and publishes it to the rolling
+# "latest" release. The DeskBuddy device polls that release (see otapull.h) and
+# self-flashes when the published version differs from what it is running.
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:            # allow a manual rebuild from the Actions tab
+
+permissions:
+  contents: write               # needed to create/update the release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Short SHA
+        run: echo "SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: Install arduino-cli
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 core
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls \
+            https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32
+
+      - name: Install libraries
+        run: |
+          arduino-cli lib install "GFX Library for Arduino"
+          arduino-cli lib install "FastIMU"
+          arduino-cli lib install "ArduinoJson"
+
+      # secrets.h is gitignored and never committed. CI compiles with EMPTY
+      # credentials — the device holds real Wi-Fi creds in its own NVS flash
+      # (see credentials.h), so nothing sensitive is ever built into a public
+      # release binary.
+      - name: Generate empty secrets.h
+        run: |
+          cat > DeskBuddy/secrets.h <<'EOF'
+          #pragma once
+          #define WIFI_SSID   ""
+          #define WIFI_PASS   ""
+          #define OTA_PASSWORD ""
+          #define QUOTES_URL  ""
+          EOF
+
+      - name: Compile
+        run: |
+          arduino-cli compile \
+            --fqbn "esp32:esp32:esp32c6:CDCOnBoot=cdc,PartitionScheme=no_fs" \
+            --build-property "compiler.cpp.extra_flags=-DFW_VERSION=\"${SHA}\"" \
+            --output-dir build \
+            DeskBuddy
+          cp build/DeskBuddy.ino.bin DeskBuddy.bin
+          echo -n "${SHA}" > version.txt
+
+      - name: Publish rolling "latest" release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "Latest firmware (${{ env.SHA }})"
+          body: "Auto-built from ${{ github.sha }}. The DeskBuddy device pulls this within ~6h, or on next boot."
+          files: |
+            DeskBuddy.bin
+            version.txt
+          make_latest: true
