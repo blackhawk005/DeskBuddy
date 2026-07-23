@@ -155,18 +155,32 @@ private:
     }
   }
 
-  // Greeting line under the face. Normally "Hi Pannu"; while a message is unread
-  // it becomes the notification (in cyan so it stands out), reverting once the
-  // message is opened. Auto-sizes down to size 1 when the longer text needs it.
+  // Greeting under the face, always size 2 for readability. Normally the single
+  // line "Hi Pannu"; while a message is unread it becomes the notification in
+  // cyan, greedy-wrapped onto two centred lines. Reverts once the message is
+  // opened. When the notification shows, renderFace raises the mouth to make room
+  // (MSG_ACTIVE positions below).
   void drawGreeting() {
-    const char* g = msgUnread ? MSG_GREETING : FACE_GREETING;
-    int len = (int)strlen(g);
-    uint8_t sz = (len * 12 <= SCREEN_W - 8) ? 2 : 1;    // size 2 if it fits, else 1
-    int charW = 6 * sz, charH = 8 * sz;
-    gfx->setTextSize(sz);
-    gfx->setTextColor(msgUnread ? ACCENT : FG, BG);
-    gfx->setCursor((SCREEN_W - len * charW) / 2, SCREEN_H - 12 - charH);
-    gfx->print(g);
+    gfx->setTextSize(2);
+    const int charW = 12;
+    if (!msgUnread) {                                   // normal single line
+      gfx->setTextColor(FG, BG);
+      gfx->setCursor((SCREEN_W - (int)strlen(FACE_GREETING) * charW) / 2, SCREEN_H - 28);
+      gfx->print(FACE_GREETING);
+      return;
+    }
+    // Notification: greedy word-wrap into two lines that each fit the width.
+    gfx->setTextColor(ACCENT, BG);
+    const int maxChars = (SCREEN_W - 8) / charW;
+    char tmp[64]; strlcpy(tmp, MSG_GREETING, sizeof(tmp));
+    String l1 = "", l2 = "";
+    for (char* w = strtok(tmp, " "); w; w = strtok(nullptr, " ")) {
+      String cand = l1.length() ? l1 + " " + w : String(w);
+      if ((int)cand.length() <= maxChars && l2.length() == 0) l1 = cand;
+      else l2 = l2.length() ? l2 + " " + w : String(w);
+    }
+    gfx->setCursor((SCREEN_W - (int)l1.length() * charW) / 2, SCREEN_H - 46); gfx->print(l1);
+    if (l2.length()) { gfx->setCursor((SCREEN_W - (int)l2.length() * charW) / 2, SCREEN_H - 28); gfx->print(l2); }
   }
 
   // ============================ FACE ============================
@@ -193,10 +207,19 @@ private:
       drawGreeting();
       lastStatBat = batPct; lastStatUnread = msgUnread;
       dirty = false;
-    } else {
+    }
+
+    // When a message is unread the two-line notification needs the bottom of the
+    // screen, so the mouth rises and the animated-erase box shrinks to match.
+    // Toggling msgUnread always forces a full redraw, so the box height only ever
+    // changes together with a clean repaint — no stale pixels.
+    int mouthDrop = msgUnread ? 44 : 60;
+    int boxH      = msgUnread ? 84 : 100;   // erase box stays above the greeting
+
+    if (!full) {
       // Erase only the animated region (covers both eyes + mouth across the full
       // range of IMU drift and every mood shape). Keeps header, dots, greeting.
-      gfx->fillRect(64, 40, 194, 100, BG);
+      gfx->fillRect(64, 40, 194, boxH, BG);
       if (batPct != lastStatBat || msgUnread != lastStatUnread) {
         statusStrip();                       // refresh battery / unread badge
         lastStatBat = batPct; lastStatUnread = msgUnread;
@@ -212,7 +235,7 @@ private:
 
     drawEye(cx() - eyeDX + driftX, eyeY + driftY, blinking, eyeColor());
     drawEye(cx() + eyeDX + driftX, eyeY + driftY, blinking, eyeColor());
-    drawMouth(cx(), eyeY + 60, mouthColor());
+    drawMouth(cx(), eyeY + mouthDrop, mouthColor());
   }
 
   const char* moodName() {
