@@ -84,6 +84,21 @@
 // ---- Greeting shown under the face (replaces the old mood name)
 #define FACE_GREETING "Hi Pannu"
 
+// ---- Optional physical navigation buttons (momentary, wired to GND)
+// Both pins are broken out on the H1 header and are otherwise UNUSED on this
+// board (verified 2026-07-23 against the Waveshare schematic — GPIO7/GPIO8 have
+// no LCD/SD/IMU/touch function). Wire each button between the GPIO and GND; the
+// internal pull-up means a press reads LOW, so no external resistor is needed.
+//   BTN_LEFT  = GPIO7  -> H1 pin 22   (previous page)
+//   BTN_RIGHT = GPIO8  -> H1 pin 20   (next page)
+//   GND       ->        H1 pin 3, 4 or 6
+// Set either to -1 to disable. If a button is unwired the pull-up holds it high
+// and nothing happens, so it's safe to leave enabled.
+// Note: GPIO8 is a boot-strapping pin — holding it down at power-on only
+// suppresses the ROM boot log (harmless). To avoid even that, use GPIO4 (pin 17).
+#define BTN_LEFT   7
+#define BTN_RIGHT  8
+
 // ---- GitHub
 // The account whose public stats show on the GitHub page (the recipient, Pannu).
 // This is NOT the dev/push account (blackhawk005) — see .env dev_gh.

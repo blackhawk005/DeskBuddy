@@ -199,6 +199,14 @@ void setup() {
     Serial.println("touch: polling AXS5106L at 0x63 (INT line unused)");
   #endif
 
+  // Optional physical nav buttons (safe no-op if nothing is wired).
+  #if BTN_LEFT  >= 0
+    pinMode(BTN_LEFT,  INPUT_PULLUP);
+  #endif
+  #if BTN_RIGHT >= 0
+    pinMode(BTN_RIGHT, INPUT_PULLUP);
+  #endif
+
   Serial.printf("firmware version: %s\n", FW_VERSION);
 
   // Wi-Fi creds and message URL come from NVS (survive OTA), not compile-time.
@@ -213,6 +221,29 @@ void setup() {
   netMx = xSemaphoreCreateMutex();
   xTaskCreate(netTask, "net", 16384, nullptr, 1, nullptr);
   Serial.println("networking moved to background task");
+}
+
+// Debounced edge-detect for a momentary button wired to GND (INPUT_PULLUP, so
+// LOW = pressed). Returns true once per press. Coexists with touch — either can
+// drive navigation.
+bool buttonPressed(uint8_t pin, bool& prev, uint32_t& tEdge) {
+  bool now = digitalRead(pin);
+  if (now == prev) return false;
+  if (millis() - tEdge < 30) return false;      // debounce window
+  tEdge = millis();
+  prev = now;
+  return (now == LOW);                          // fire on the press edge only
+}
+
+void handleButtons() {
+  #if BTN_LEFT >= 0
+    static bool pL = HIGH; static uint32_t tL = 0;
+    if (buttonPressed(BTN_LEFT, pL, tL))  { face.prevPage(); Serial.println("[btn] LEFT -> prev"); }
+  #endif
+  #if BTN_RIGHT >= 0
+    static bool pR = HIGH; static uint32_t tR = 0;
+    if (buttonPressed(BTN_RIGHT, pR, tR)) { face.nextPage(); Serial.println("[btn] RIGHT -> next"); }
+  #endif
 }
 
 void handleGesture(int x, int y, bool pressed) {
@@ -284,6 +315,9 @@ void loop() {
     if (prev && !now) face.nextPage();
     prev = now;
   #endif
+
+  // ---- physical nav buttons (coexist with touch)
+  handleButtons();
 
   // ---- battery + brightness dim when idle-dark could go here
   face.setBattery(readBatteryPct());
