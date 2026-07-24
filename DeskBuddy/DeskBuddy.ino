@@ -56,6 +56,21 @@ Face face(gfx, bus);
 QMI8658 imu;
 calData calib = {0};
 AccelData accel;
+GyroData gyro;
+
+// ---- pet-like behaviour + night mode
+// lastInteractionMs is bumped by a tap OR by physical movement (pick-up/shake).
+// Used both to bring the buddy back from "lonely" and to wake the screen at night.
+uint32_t lastInteractionMs = 0;
+uint32_t reactUntilMs = 0;        // a startle (surprised) reaction is showing until this
+#define LONELY_MS   (2UL * 60UL * 60UL * 1000UL)   // untouched this long -> sleepy
+#define SHAKE_DPS   220.0f        // gyro magnitude (deg/s) that counts as a shake
+#define BUMP_G      0.45f         // sudden accel change (g) that counts as a pick-up
+#define NIGHT_START 22            // 22:00
+#define NIGHT_END    6            //  6:00
+#define BL_DAY      220           // backlight duty by day / when awake
+#define BL_NIGHT      0           // backlight off at night when idle
+#define WAKE_MS     (15UL * 1000UL)   // stay lit this long after a night interaction
 
 // ---- touch state
 bool touchActive = false;
@@ -92,6 +107,47 @@ int readBatteryPct() {
   float vbat = raw * BAT_ADC_DIVIDER / 1000.0f;      // volts
   int pct = (int)((vbat - 3.30f) / (4.20f - 3.30f) * 100.0f);
   return constrain(pct, 0, 100);
+}
+
+// ---- Pet-like behaviour: react to being picked up / shaken, and drift to
+// "sleepy" when left alone for a long time. Runs every frame on the UI thread.
+void updatePet() {
+  imu.getGyro(&gyro);
+  float gmag = sqrtf(gyro.gyroX*gyro.gyroX + gyro.gyroY*gyro.gyroY + gyro.gyroZ*gyro.gyroZ);
+  float amag = sqrtf(accel.accelX*accel.accelX + accel.accelY*accel.accelY + accel.accelZ*accel.accelZ);
+  static float prevA = 1.0f;
+  float jerk = fabsf(amag - prevA);
+  prevA = amag;
+  uint32_t now = millis();
+
+  bool disturbed = (gmag > SHAKE_DPS) || (jerk > BUMP_G);
+  if (disturbed) {
+    lastInteractionMs = now;                 // movement counts as attention
+    if (now > reactUntilMs) {                // startle (don't re-trigger constantly)
+      face.setMood(MOOD_SURPRISED);
+      reactUntilMs = now + 1200;
+    }
+  } else if (reactUntilMs && now > reactUntilMs) {
+    reactUntilMs = 0;
+    face.setMood(MOOD_HAPPY);                // settle to content after being startled
+  }
+
+  // Lonely: no attention for a long time -> quietly go sleepy.
+  if (reactUntilMs == 0 && now - lastInteractionMs > LONELY_MS &&
+      face.getMood() != MOOD_SLEEPY) {
+    face.setMood(MOOD_SLEEPY);
+  }
+}
+
+// ---- Night mode: dim the screen off during night hours, wake it briefly on
+// any interaction (tap or movement). No-op if the clock isn't set yet.
+void updateNightMode() {
+  time_t tt = time(nullptr);
+  if (tt < 100000) return;                   // clock not seeded — leave lit
+  struct tm t; localtime_r(&tt, &t);
+  bool night = (t.tm_hour >= NIGHT_START || t.tm_hour < NIGHT_END);
+  bool awake = !night || (millis() - lastInteractionMs < WAKE_MS);
+  face.setBrightness(awake ? BL_DAY : BL_NIGHT);
 }
 
 // Publish a fetched message into the shared buffer for the UI to pick up.
@@ -215,6 +271,7 @@ void setup() {
 void handleGesture(int x, int y, bool pressed) {
   if (pressed && !touchActive) {                 // touch DOWN -> act now
     touchActive = true;
+    lastInteractionMs = millis();                // a tap is attention (un-lonely, wakes)
     if (x < ZONE_LEFT_MAX) {
       face.prevPage();  Serial.printf("[touch] LEFT@%d -> prev (page %d)\n", x, (int)face.getPage());
     } else if (x > ZONE_RIGHT_MIN) {
@@ -230,11 +287,12 @@ void handleGesture(int x, int y, bool pressed) {
 }
 
 void loop() {
-  // ---- IMU -> eye drift
+  // ---- IMU -> eye drift + pet reactions
   // FastIMU 1.3.0's update() returns void, so there is no status to test here.
   imu.update();
   imu.getAccel(&accel);
   face.setTilt(accel.accelX, accel.accelY);
+  updatePet();          // pick-up / shake / lonely behaviour
 
   // ---- Touch
   #if USE_TOUCH
@@ -260,8 +318,11 @@ void loop() {
     prev = now;
   #endif
 
-  // ---- battery + brightness dim when idle-dark could go here
+  // ---- battery
   face.setBattery(readBatteryPct());
+
+  // ---- night mode: dim the screen off overnight, wake on interaction
+  updateNightMode();
 
   // ---- Serial provisioning: "wifi <ssid> <pass>" to re-point without a rebuild
   credsSerialTask();

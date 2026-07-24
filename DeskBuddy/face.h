@@ -4,9 +4,11 @@
 // ============================================================================
 #pragma once
 #include <Arduino_GFX_Library.h>
+#include <time.h>
 #include "config.h"
 #include "panel.h"
 #include "net.h"
+#include "festivals.h"
 
 // Page indices for swipe navigation. Weather removed per owner request
 // 2026-07-23. PAGE_MESSAGE added same day — live message feed from an endpoint.
@@ -54,6 +56,7 @@ public:
   void prevPage()  { setPage((Page)((page + PAGE_COUNT - 1) % PAGE_COUNT)); }
   void setMood(Mood m)         { mood = m; blinkUntil = 0; dirty = true; }
   void cycleMood() { setMood((Mood)((mood + 1) % MOOD_COUNT)); }
+  Mood getMood() const         { return mood; }
 
   // --- IMU eye drift: feed accel in g (x,y). Eyes lean toward "down".
   void setTilt(float ax, float ay) {
@@ -123,6 +126,13 @@ private:
   int  lastStatBat = -2;
   bool lastStatUnread = false;
 
+  // Cached greeting state (message / festival / time-of-day). Recomputed each
+  // frame; a change forces a full redraw. festiveColor != 0 tints the face.
+  char     shownGreeting[80] = "";
+  uint16_t shownGreetingCol  = RGB565_WHITE;
+  bool     shownTwoLine      = false;
+  uint16_t festiveColor      = 0;
+
   // GFX_Library_for_Arduino >= 1.4 uses RGB565_* names; the bare WHITE/BLACK
   // aliases were removed. The panel is full-colour (JD9853, 262K colours) — the
   // dashboard is mono by design, but these accents prove colour works and make
@@ -155,24 +165,46 @@ private:
     }
   }
 
-  // Greeting under the face, always size 2 for readability. Normally the single
-  // line "Hi Pannu"; while a message is unread it becomes the notification in
-  // cyan, greedy-wrapped onto two centred lines. Reverts once the message is
-  // opened. When the notification shows, renderFace raises the mouth to make room
-  // (MSG_ACTIVE positions below).
+  // Decide what the greeting line should say right now, by priority:
+  //   1. unread message -> the notification (cyan, two lines)
+  //   2. a festival today -> festive message in the festival's colour
+  //   3. otherwise -> a time-of-day greeting ("Good morning, Pannu")
+  // Sets `col`/`twoLine`, and `festive` (true when a festival tints the face).
+  const char* currentGreeting(uint16_t& col, bool& twoLine, bool& festive) {
+    static char buf[80];
+    festive = false;
+    if (msgUnread) { col = ACCENT; twoLine = true; return MSG_GREETING; }
+
+    time_t tt = time(nullptr); struct tm t; localtime_r(&tt, &t);
+    uint16_t fcol;
+    if (festivalToday(t, buf, sizeof(buf), &fcol)) {
+      col = fcol; festive = true;
+      twoLine = ((int)strlen(buf) * 12 > SCREEN_W - 8);
+      return buf;
+    }
+    int h = t.tm_hour;
+    const char* tod = (h < 5)  ? "Good night"
+                    : (h < 12) ? "Good morning"
+                    : (h < 17) ? "Good afternoon"
+                    : (h < 21) ? "Good evening" : "Good night";
+    snprintf(buf, sizeof(buf), "%s, Pannu", tod);
+    col = FG; twoLine = ((int)strlen(buf) * 12 > SCREEN_W - 8);
+    return buf;
+  }
+
+  // Draw the cached greeting (shownGreeting/Col/TwoLine), size 2, centred in the
+  // band under the face. Wraps to two lines when flagged.
   void drawGreeting() {
-    gfx->setTextSize(2);
     const int charW = 12;
-    if (!msgUnread) {                                   // normal single line
-      gfx->setTextColor(FG, BG);
-      gfx->setCursor((SCREEN_W - (int)strlen(FACE_GREETING) * charW) / 2, SCREEN_H - 28);
-      gfx->print(FACE_GREETING);
+    gfx->setTextSize(2);
+    gfx->setTextColor(shownGreetingCol, BG);
+    if (!shownTwoLine) {
+      gfx->setCursor((SCREEN_W - (int)strlen(shownGreeting) * charW) / 2, SCREEN_H - 28);
+      gfx->print(shownGreeting);
       return;
     }
-    // Notification: greedy word-wrap into two lines that each fit the width.
-    gfx->setTextColor(ACCENT, BG);
+    char tmp[80]; strlcpy(tmp, shownGreeting, sizeof(tmp));
     const int maxChars = (SCREEN_W - 8) / charW;
-    char tmp[64]; strlcpy(tmp, MSG_GREETING, sizeof(tmp));
     String l1 = "", l2 = "";
     for (char* w = strtok(tmp, " "); w; w = strtok(nullptr, " ")) {
       String cand = l1.length() ? l1 + " " + w : String(w);
@@ -185,6 +217,18 @@ private:
 
   // ============================ FACE ============================
   void renderFace(uint32_t now) {
+    // Refresh the greeting (message / festival / time-of-day). If the text
+    // changed since last frame (new hour, festival starts, message arrives),
+    // force a full redraw so it repaints cleanly.
+    uint16_t gcol; bool gtwo, gfest;
+    const char* g = currentGreeting(gcol, gtwo, gfest);
+    if (strcmp(g, shownGreeting) != 0 || gcol != shownGreetingCol) {
+      strlcpy(shownGreeting, g, sizeof(shownGreeting));
+      shownGreetingCol = gcol; shownTwoLine = gtwo;
+      dirty = true;
+    }
+    festiveColor = gfest ? gcol : 0;      // tint eyes/mouth on festival days
+
     // Blink scheduling
     bool blinking = false;
     if (blinkUntil == 0 && now >= lastBlink) { blinkUntil = now + 120; }
@@ -209,12 +253,12 @@ private:
       dirty = false;
     }
 
-    // When a message is unread the two-line notification needs the bottom of the
-    // screen, so the mouth rises and the animated-erase box shrinks to match.
-    // Toggling msgUnread always forces a full redraw, so the box height only ever
-    // changes together with a clean repaint — no stale pixels.
-    int mouthDrop = msgUnread ? 44 : 60;
-    int boxH      = msgUnread ? 84 : 100;   // erase box stays above the greeting
+    // A two-line greeting (long notification or festival message) needs the
+    // bottom of the screen, so the mouth rises and the animated-erase box shrinks
+    // to match. shownTwoLine only changes alongside a full redraw, so the box
+    // height never leaves stale pixels.
+    int mouthDrop = shownTwoLine ? 44 : 60;
+    int boxH      = shownTwoLine ? 84 : 100;  // erase box stays above the greeting
 
     if (!full) {
       // Erase only the animated region (covers both eyes + mouth across the full
@@ -252,6 +296,7 @@ private:
   // (neutral, happy) as requested; the expressive moods tint — love = red heart,
   // surprised = orange, sleepy = blue. The mouth always carries the mood colour.
   uint16_t eyeColor() {
+    if (festiveColor) return festiveColor;      // festival day: theme the face
     switch (mood) {
       case MOOD_LOVE:      return RGB565_RED;
       case MOOD_SURPRISED: return RGB565_ORANGE;
@@ -260,6 +305,7 @@ private:
     }
   }
   uint16_t mouthColor() {
+    if (festiveColor) return festiveColor;
     switch (mood) {
       case MOOD_LOVE:      return RGB565_RED;
       case MOOD_HAPPY:     return RGB565_YELLOW;
