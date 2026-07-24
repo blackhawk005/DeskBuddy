@@ -10,10 +10,10 @@
 #include "net.h"
 #include "festivals.h"
 
-// Page indices for swipe navigation. Weather removed per owner request
-// 2026-07-23. PAGE_MESSAGE added same day — live message feed from an endpoint.
-enum Page { PAGE_FACE, PAGE_MESSAGE, PAGE_CLOCK, PAGE_DATE, PAGE_MOON,
-            PAGE_QUOTE, PAGE_GITHUB, PAGE_COUNT };
+// Page indices for swipe navigation. Weather removed 2026-07-23; PAGE_MESSAGE
+// (live feed) and PAGE_COUNTDOWN (next-event counter) added the same day.
+enum Page { PAGE_FACE, PAGE_MESSAGE, PAGE_COUNTDOWN, PAGE_CLOCK, PAGE_DATE,
+            PAGE_MOON, PAGE_QUOTE, PAGE_GITHUB, PAGE_COUNT };
 
 // Moods set by tap
 enum Mood { MOOD_NEUTRAL, MOOD_HAPPY, MOOD_LOVE, MOOD_SLEEPY, MOOD_SURPRISED, MOOD_COUNT };
@@ -96,7 +96,8 @@ public:
       case PAGE_DATE:  if (dirty) { renderDate(); dirty=false; } break;
       case PAGE_MOON:    if (dirty) { renderMoon(); dirty=false; } break;
       case PAGE_QUOTE:   if (dirty) { renderQuote(); dirty=false; } break;
-      case PAGE_MESSAGE: if (dirty) { renderMessage(); dirty=false; } break;
+      case PAGE_MESSAGE:  if (dirty) { renderMessage(); dirty=false; } break;
+      case PAGE_COUNTDOWN: if (dirty || now - lastClock > 60000) { renderCountdown(); lastClock = now; dirty=false; } break;
       case PAGE_GITHUB:  if (dirty) { renderGitHub(); dirty=false; } break;
       default: break;
     }
@@ -473,6 +474,30 @@ private:
     header("MESSAGE");
     if (!hasMessage) { drawWrappedBlock("waiting for a message...", 2, FG); return; }
     drawWrappedBlock(message, 2, ACCENT);
+  }
+
+  // Countdown to the closest upcoming festival / special day.
+  void renderCountdown() {
+    header("NEXT EVENT");
+    NextEvent e = nextFestival(time(nullptr));
+    if (!e.valid) { gfx->setTextColor(FG, BG); bigText("--", SCREEN_H/2, 3); return; }
+
+    // Event name near the top, in its theme colour (shrink if it's wide).
+    int nlen = (int)strlen(e.name);
+    uint8_t nsz = (nlen * 12 <= SCREEN_W - 8) ? 2 : 1;
+    gfx->setTextColor(e.color, BG);
+    gfx->setTextSize(nsz);
+    gfx->setCursor((SCREEN_W - nlen * 6 * nsz) / 2, 30);
+    gfx->print(e.name);
+
+    if (e.happening) {
+      bigText("TODAY!", SCREEN_H/2 + 6, 5);          // it's the day itself
+    } else {
+      char num[8]; snprintf(num, sizeof(num), "%d", e.daysUntil);
+      bigText(num, 56, 6);                            // big day count in theme colour
+      gfx->setTextColor(FG, BG);
+      bigText(e.daysUntil == 1 ? "DAY TO GO" : "DAYS TO GO", 132, 2);
+    }
   }
 
   void renderGitHub() {
