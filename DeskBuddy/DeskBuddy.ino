@@ -323,11 +323,17 @@ void setup() {
   WiFi.setAutoReconnect(true);
 
   // Hand ALL networking to a background task so the display/touch never block on
-  // it. 16KB stack because mbedTLS (HTTPS) is stack-hungry; priority 1 == the
-  // Arduino loop task, so they time-slice and the UI stays smooth.
+  // it. 16KB stack because mbedTLS (HTTPS) is stack-hungry. It runs at priority 1.
   netMx = xSemaphoreCreateMutex();
   xTaskCreate(netTask, "net", 16384, nullptr, 1, nullptr);
-  Serial.println("networking moved to background task");
+
+  // Raise THIS (UI) task above the network task. On the single C6 core they'd
+  // otherwise time-slice, so a TLS handshake — frequent while the marginal AP
+  // reconnects the SSE stream — would steal half the core and make touch lag.
+  // At higher priority the UI preempts networking instantly; networking uses only
+  // the slack between frames, so touch is fast whatever Wi-Fi is doing.
+  vTaskPrioritySet(nullptr, 2);
+  Serial.println("networking on background task (UI prioritised)");
 }
 
 // Touch-zone navigation. Acts on the touch-DOWN edge (snappiest possible), by
