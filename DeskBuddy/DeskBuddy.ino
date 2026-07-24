@@ -140,14 +140,27 @@ void updatePet() {
 }
 
 // ---- Night mode: dim the screen off during night hours, wake it briefly on
-// any interaction (tap or movement). No-op if the clock isn't set yet.
+// any interaction (tap or movement). Plays a bedtime yawn as it drifts off.
+// No-op if the clock isn't set yet.
 void updateNightMode() {
   time_t tt = time(nullptr);
   if (tt < 100000) return;                   // clock not seeded — leave lit
   struct tm t; localtime_r(&tt, &t);
   bool night = (t.tm_hour >= NIGHT_START || t.tm_hour < NIGHT_END);
   bool awake = !night || (millis() - lastInteractionMs < WAKE_MS);
-  face.setBrightness(awake ? BL_DAY : BL_NIGHT);
+
+  static bool     wasAwake  = true;
+  static uint32_t yawnEndMs = 0;
+  uint32_t now = millis();
+  if (wasAwake && !awake) {                   // just started drifting to sleep
+    face.startYawn();                         // yawn animation before dimming
+    yawnEndMs = now + 2600;
+  }
+  wasAwake = awake;
+
+  // Keep the screen lit through the yawn, then let it go dark.
+  bool lit = awake || (now < yawnEndMs);
+  face.setBrightness(lit ? BL_DAY : BL_NIGHT);
 }
 
 // Publish a fetched message into the shared buffer for the UI to pick up.

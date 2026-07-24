@@ -82,10 +82,22 @@ public:
     strlcpy(message, m, sizeof(message));
     hasMessage = true;
     msgUnread = true;
+    // A message from Shinit makes it happy & blushy: love eyes + pink cheeks.
+    mood = MOOD_LOVE;
+    blinkUntil = 0;
+    blushUntil = millis() + 8000;
     if (page == PAGE_FACE) dirty = true;  // refresh the home greeting right away
     return true;
   }
   bool messageUnread() const { return msgUnread; }
+
+  // Bedtime yawn: a brief wide-mouth yawn + droopy eyes before the screen sleeps.
+  void startYawn() {
+    yawnUntil = millis() + 2500;
+    mood = MOOD_SLEEPY;
+    setPage(PAGE_FACE);                   // go home to yawn
+    dirty = true;
+  }
 
   // --- main render tick
   void tick() {
@@ -121,6 +133,8 @@ private:
   char message[160] = "";
   bool hasMessage = false;
   bool msgUnread = false;
+  uint32_t blushUntil = 0;      // pink cheeks while a fresh message glows
+  uint32_t yawnUntil  = 0;      // bedtime yawn animation active until this
 
   // Partial-redraw bookkeeping for the face page: the status strip is only
   // repainted when the battery level or unread badge actually changes.
@@ -240,6 +254,9 @@ private:
     }
     // Sleepy mood auto-blinks slow & half-closed
     if (mood == MOOD_SLEEPY) blinking = ((now / 400) % 2) == 0;
+    // During a yawn the eyes droop mostly-closed.
+    bool yawning = (now < yawnUntil);
+    if (yawning) blinking = ((now / 250) % 3) != 0;
 
     // PARTIAL REDRAW: a full-screen clear + full repaint every frame is ~110KB
     // over SPI and was the main source of sluggishness. Now the whole screen is
@@ -280,7 +297,20 @@ private:
 
     drawEye(cx() - eyeDX + driftX, eyeY + driftY, blinking, eyeColor());
     drawEye(cx() + eyeDX + driftX, eyeY + driftY, blinking, eyeColor());
-    drawMouth(cx(), eyeY + mouthDrop, mouthColor());
+
+    if (yawning) {                          // wide-open yawn mouth
+      int my = eyeY + mouthDrop + 2;
+      gfx->fillEllipse(cx(), my, 13, 18, mouthColor());
+      gfx->fillEllipse(cx(), my + 3, 7, 10, BG);
+    } else {
+      drawMouth(cx(), eyeY + mouthDrop, mouthColor());
+    }
+
+    // Blush: pink cheeks under the eyes for a few seconds after a message.
+    if (now < blushUntil) {
+      gfx->fillCircle(cx() - eyeDX + driftX, eyeY + driftY + 22, 7, RGB565_PINK);
+      gfx->fillCircle(cx() + eyeDX + driftX, eyeY + driftY + 22, 7, RGB565_PINK);
+    }
   }
 
   const char* moodName() {
