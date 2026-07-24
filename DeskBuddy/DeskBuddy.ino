@@ -86,9 +86,9 @@ uint32_t lastQuoteRot = 0;
 int quoteIdx = 0;
 
 // ---- config loaded once in setup(), then read-only (safe to share)
-String messageUrl;            // provisioned from NVS (secret token inside)
+String messageUrl;            // /raw URL from NVS (secret token inside); the SSE
+                              // stream URL is derived from it (same token)
 String wifiSsid, wifiPass;
-#define MSG_POLL_MS   (30UL * 1000UL)   // check for a new message every 30s
 #define WIFI_RETRY_MS (20UL * 1000UL)
 
 // ---- Networking runs on its OWN FreeRTOS task (netTask), so a slow/blocking
@@ -163,41 +163,49 @@ static void publishData(const MoonData& m, const GhData& g) {
   xSemaphoreGive(netMx);
 }
 
-// The ENTIRE networking lifecycle lives here, off the UI thread: initial
-// connect, reconnect on the marginal AP, LAN-OTA servicing, and the periodic
-// message + GitHub fetches. Blocking calls here only stall THIS task; the UI
-// keeps rendering at full rate because FreeRTOS runs it while this task waits
-// on the socket.
+// Parse one Server-Sent-Events line. "data:" -> new message (existing draw path);
+// ":" heartbeat and everything else -> ignored. Returns true if it was a message.
+static bool handleSseLine(const String& line) {
+  if (line.startsWith("data:")) {
+    String msg = line.substring(5);
+    if (msg.startsWith(" ")) msg = msg.substring(1);   // trim one leading space
+    publishMessage(msg.c_str());                       // -> UI draws via face.setMessage
+    Serial.printf("[sse] message: \"%s\"\n", msg.c_str());
+    return true;
+  }
+  // ":" heartbeat, "event:" lines, blanks -> ignore
+  return false;
+}
+
+// The ENTIRE networking lifecycle lives here, off the UI thread: WiFi connect +
+// reconnect, LAN-OTA, the periodic GitHub/moon refresh, and a PERSISTENT SSE
+// stream for the live message (replaces the old 30s poll). Blocking calls only
+// stall THIS task; the UI keeps rendering because FreeRTOS runs it meanwhile.
 void netTask(void*) {
   bool     wasUp    = false;
-  uint32_t lastTry  = 0, lastMsgF = 0, lastDataF = 0;
+  uint32_t lastTry  = 0, lastDataF = 0;
+
+  // SSE state
+  static WiFiClientSecure sse;           // one persistent TLS connection
+  String   sseHost, ssePath;
+  bool     streaming     = false;
+  uint32_t lastRxMs      = 0;            // last byte seen on the stream
+  uint32_t nextConnectMs = 0;            // backoff gate for the next connect attempt
+  uint8_t  backoffIdx    = 0;
+  uint8_t  failStreak    = 0;            // consecutive failed connects (for fallback)
+  String   lineBuf;
+  const uint32_t kBackoff[] = { 1000, 2000, 5000, 10000 };   // 1s,2s,5s,cap 10s
+  const uint32_t kStaleMs   = 40000;    // no data/heartbeat this long -> reconnect
+
+  if (messageUrl.length()) sseDeriveStream(messageUrl, sseHost, ssePath);
 
   netBegin(wifiSsid, wifiPass);          // blocking connect — UI unaffected
 
   for (;;) {
     uint32_t t = millis();
 
-    if (netUp()) {
-      if (!wasUp) {                       // just (re)connected
-        wasUp = true;
-        Serial.print("WiFi up: http://"); Serial.println(WiFi.localIP());
-        otaBegin("deskbuddy");            // LAN OTA (browser/IDE) lives on this task
-        lastMsgF = lastDataF = 0;         // force an immediate first fetch
-      }
-      otaHandle();                        // service LAN OTA without touching the UI
-
-      if (messageUrl.length() && (lastMsgF == 0 || t - lastMsgF > MSG_POLL_MS)) {
-        char b[160];
-        if (fetchMessage(messageUrl, b, sizeof(b))) publishMessage(b);
-        lastMsgF = t ? t : 1;
-      }
-      if (lastDataF == 0 || t - lastDataF > NET_REFRESH_MS) {
-        MoonData m = computeMoon(time(nullptr));   // local calc
-        GhData   g = fetchGitHub();                // network
-        publishData(m, g);
-        lastDataF = t ? t : 1;
-      }
-    } else {
+    if (!netUp()) {                       // ---- WiFi down: drop stream, retry link
+      if (streaming) { sse.stop(); streaming = false; }
       wasUp = false;
       if (t - lastTry > WIFI_RETRY_MS) {
         Serial.println("WiFi: retrying...");
@@ -205,8 +213,66 @@ void netTask(void*) {
         WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
         lastTry = t;
       }
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
     }
-    vTaskDelay(pdMS_TO_TICKS(50));        // yield so UI + idle always run
+
+    if (!wasUp) {                         // ---- just (re)connected
+      wasUp = true;
+      Serial.print("WiFi up: http://"); Serial.println(WiFi.localIP());
+      otaBegin("deskbuddy");              // LAN OTA (browser/IDE) lives on this task
+      lastDataF   = 0;                    // force an immediate GitHub/moon refresh
+      nextConnectMs = 0;                  // connect the stream now
+    }
+    otaHandle();
+
+    // ---- periodic GitHub + moon (unchanged, every 15 min)
+    if (lastDataF == 0 || t - lastDataF > NET_REFRESH_MS) {
+      MoonData m = computeMoon(time(nullptr));
+      GhData   g = fetchGitHub();
+      publishData(m, g);
+      lastDataF = t ? t : 1;
+    }
+
+    // ---- SSE stream
+    if (!streaming) {
+      if (sseHost.length() && t >= nextConnectMs) {
+        if (sseOpen(sse, sseHost, ssePath)) {
+          streaming = true; lastRxMs = t; backoffIdx = 0; failStreak = 0; lineBuf = "";
+          Serial.println("[sse] connected");
+        } else {
+          sse.stop();
+          failStreak++;
+          uint32_t bo = kBackoff[backoffIdx < 4 ? backoffIdx : 3];
+          if (backoffIdx < 3) backoffIdx++;
+          nextConnectMs = t + bo;
+          Serial.printf("[sse] connect failed (#%u) -> retry in %lums\n",
+                        failStreak, (unsigned long)bo);
+          // Fallback: after a few failures, one-shot the old /raw poll so the
+          // screen still shows the current message while we keep retrying.
+          if (failStreak == 3) {
+            char b[160];
+            if (fetchMessage(messageUrl, b, sizeof(b))) publishMessage(b);
+          }
+        }
+      }
+    } else {
+      // Non-blocking: consume only the bytes already available, split on '\n'.
+      while (sse.available()) {
+        char ch = (char)sse.read();
+        lastRxMs = t;
+        if (ch == '\n')      { handleSseLine(lineBuf); lineBuf = ""; }
+        else if (ch != '\r') { if (lineBuf.length() < 300) lineBuf += ch; }
+      }
+      // Reconnect if the socket closed or the stream went silent past the heartbeat.
+      if (!sse.connected() || t - lastRxMs > kStaleMs) {
+        Serial.println("[sse] stale/closed -> reconnect");
+        sse.stop(); streaming = false; lineBuf = "";
+        backoffIdx = 0; nextConnectMs = t + kBackoff[0];
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(20));        // yield so UI + idle run; feeds the WDT
   }
 }
 

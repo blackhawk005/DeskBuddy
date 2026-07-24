@@ -113,6 +113,67 @@ inline bool fetchMessage(const String& url, char* out, size_t outSize) {
   return ok;
 }
 
+// ------------------------------------------------------------ SSE message stream
+// Persistent Server-Sent-Events connection to the /status/stream endpoint, so the
+// message updates within ~1-2s instead of on the 30s poll. Reuses the same token
+// (the URL is derived from the /raw URL already in NVS).
+
+// Derive stream host + path from the /raw message URL (same token).
+inline void sseDeriveStream(const String& rawUrl, String& host, String& path) {
+  String u = rawUrl;
+  u.replace("/status/raw", "/status/stream");   // same host + token, stream path
+  int s = u.indexOf("://");
+  String rest = (s >= 0) ? u.substring(s + 3) : u;
+  int slash = rest.indexOf('/');
+  host = (slash >= 0) ? rest.substring(0, slash) : rest;
+  path = (slash >= 0) ? rest.substring(slash)   : "/";
+}
+
+// Open the TLS stream and consume the response headers. Returns true only on a
+// 200 with the socket still open (ready to stream the body forever). This sends a
+// RAW GET and does NOT wait for a body — the body never ends.
+inline bool sseOpen(WiFiClientSecure& c, const String& host, const String& path) {
+  c.setInsecure();                         // skip cert validation (acceptable here)
+  c.setHandshakeTimeout(10);               // bound the TLS handshake (seconds)
+  if (!c.connect(host.c_str(), 443)) {
+    Serial.println("[sse] TLS connect failed");
+    return false;
+  }
+  c.print(String("GET ") + path + " HTTP/1.1\r\n");
+  c.print(String("Host: ") + host + "\r\n");
+  c.print("Accept: text/event-stream\r\n");
+  c.print("Cache-Control: no-cache\r\n");
+  c.print("Connection: keep-alive\r\n");
+  c.print("\r\n");
+
+  // Read status line + headers up to the blank line, byte by byte with our own
+  // timeout (independent of setTimeout's unit, which varies across cores). CR is
+  // ignored, so a blank "\r\n" separator arrives as an empty line = headers done.
+  // Body bytes that arrive after stay buffered for the caller's read loop.
+  bool ok = false;
+  String line;
+  uint32_t t0 = millis();
+  while (millis() - t0 < 8000) {
+    if (c.available()) {
+      char ch = (char)c.read();
+      if (ch == '\r') continue;
+      if (ch == '\n') {
+        if (line.length() == 0) break;     // blank line -> end of headers
+        if (line.startsWith("HTTP/")) { Serial.printf("[sse] %s\n", line.c_str());
+          if (line.startsWith("HTTP/1.1 200") || line.startsWith("HTTP/1.0 200")) ok = true; }
+        line = "";
+      } else if (line.length() < 200) {
+        line += ch;
+      }
+    } else if (!c.connected()) {
+      break;
+    } else {
+      delay(2);                            // yield while waiting for headers
+    }
+  }
+  return ok && c.connected();
+}
+
 // Map WMO weather codes to a compact label for the mono dashboard.
 inline const char* wxLabel(int code) {
   if (code < 0) return "—";
